@@ -47,7 +47,10 @@ module Network.DNS
   , DnsResp(..)
   ) where
 
-import Data.Typeable
+import Data.Typeable (Typeable)
+#if !MIN_VERSION_base(4,7,0)
+import Data.Typeable (Typeable1)
+#endif
 import Data.Proxy (Proxy(..))
 import Data.Foldable (forM_)
 import Data.Hashable
@@ -445,7 +448,11 @@ data DnsType α where
   -- Mail exchange record (/MX/)
   MxDnsType    ∷ DnsType (Word16, HostName)
 
+#if MIN_VERSION_base(4,7,0)
+deriving instance Typeable DnsType
+#else
 deriving instance Typeable1 DnsType
+#endif
 deriving instance Eq (DnsType α)
 
 instance Show (DnsType α) where
