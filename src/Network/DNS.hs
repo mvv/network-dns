@@ -1,4 +1,5 @@
 {-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -292,7 +293,12 @@ instance Serializer BinarySerializer where
   getWord32be _ = B.getWord32be
   getIP4 _ = B.get
   getIP6 _ = B.get
-  getByteString _ = B.getBytes
+  getByteString _ =
+#if MIN_VERSION_binary(0,6,0)
+    B.getByteString
+#else
+    B.getBytes
+#endif
   isolate _ = undefined
 
 data CerealSerializer = CerealSerializer
