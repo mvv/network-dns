@@ -63,12 +63,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BSL
-import Data.Binary (Binary)
-import qualified Data.Binary as B
-import qualified Data.Binary.Put as B
+import qualified Data.ByteString.Builder as BB
 import qualified Data.Binary.Get as B
-import Data.Serialize (Serialize)
-import qualified Data.Serialize as S
+import Data.Serializer (Serializer, Serializable, SizedSerializable)
+import qualified Data.Serializer as S
+import Data.Deserializer (Deserializer, Deserializable)
+import qualified Data.Deserializer as D
 import Text.Parser.Combinators as P
 import Text.Parser.Char as P
 import Text.Printer ((<>))
@@ -118,23 +118,23 @@ instance Textual HostName where
   textual = go [] (0 ∷ Int) False [] (0 ∷ Int) <?> "host name"
     where alphaNumOrDashOrDot c = A.isAlphaNum c || c == '-' || c == '.'
           go !ls !ncs _ _ 0 =
-            optional (P.satisfy A.isAlpha) >>= \case
+            optional (satisfy A.isAlpha) >>= \case
               Just c  → if ncs == 255
-                        then P.unexpected "Host name is too long"
+                        then unexpected "Host name is too long"
                         else go ls (ncs + 1) False [A.ascii c] 1
-              Nothing → P.unexpected "A letter expected"
+              Nothing → unexpected "A letter expected"
           go !ls !ncs !dash !lcs !nlcs =
-            optional (P.satisfy alphaNumOrDashOrDot) >>= \case
+            optional (satisfy alphaNumOrDashOrDot) >>= \case
               Just '.' → if dash
-                         then P.unexpected "Label ends with a dash"
+                         then unexpected "Label ends with a dash"
                          else if ncs == 255
-                              then P.unexpected "Host name is too long"
+                              then unexpected "Host name is too long"
                               else go (reverse (A.ascii '.' : lcs) : ls)
                                       (ncs + 1) False [] 0
               Just c   → if nlcs == 63
-                         then P.unexpected "Label is too long"
+                         then unexpected "Label is too long"
                          else if ncs == 255
-                              then P.unexpected "Host name is too long"
+                              then unexpected "Host name is too long"
                               else go ls (ncs + 1) (c == '-')
                                          (A.ascii c : lcs) (nlcs + 1)
               Nothing  → return $ HN $ BS.pack $ concat
@@ -147,7 +147,7 @@ instance Textual (InetAddr HostName) where
   textual = InetAddr <$> T.textual <*> (P.char ':' *> T.textual)
 
 -- | List the 'HostName' labels:
---   
+--
 -- @
 --   'hostNameLabels' ('Data.Maybe.fromJust' ('Data.Textual.fromString' /"www.google.com"/)) = [/"www"/, /"google"/, /"com"/]
 -- @
@@ -168,23 +168,41 @@ arpaHostName (IPv6 a) =
     HN $ BS8.pack $ digits (reverse $ ip6ToWordList a) ++ "ip6.arpa"
   where digits (w : ws) = [d4, '.', d3, '.', d2, '.', d1, '.'] ++ digits ws
           where d1 = toDigit $ w `shiftR` 12
-                d2 = toDigit $ w `shiftR` 8 .&. 0xF 
-                d3 = toDigit $ w `shiftR` 4 .&. 0xF 
-                d4 = toDigit $ w .&. 0xF 
+                d2 = toDigit $ w `shiftR` 8 .&. 0xF
+                d3 = toDigit $ w `shiftR` 4 .&. 0xF
+                d4 = toDigit $ w .&. 0xF
                 toDigit n | n < 10    = chr $ ord '0' + fromIntegral n
                           | otherwise = chr $ ord 'a' + fromIntegral n - 10
         digits [] = []
 
+newtype Writer s α = Writer { runWriter ∷ (s → s) → (s → s, α) }
+
+instance Functor (Writer s) where
+  fmap f m = Writer $ \append →
+               let (append', x) = runWriter m append
+               in (append', f x)
+
+instance Applicative (Writer s) where
+  pure = return
+  {-# INLINE pure #-}
+  (<*>) = ap
+  {-# INLINE (<*>) #-}
+
+instance Monad (Writer s) where
+  return x = Writer $ \append → (append, x)
+  m >>= f = Writer $ \append →
+              let (append', x) = runWriter m append
+              in runWriter (f x) append'
+
 newtype StateT k v μ α =
   StateT { runStateT ∷ Map k v → Maybe Word16 → μ (Map k v, Maybe Word16, α) }
 
-type CompT μ α   = StateT [ByteString] Word16 μ α
+type CompT s α   = StateT [ByteString] Word16 (Writer s) α
 type DecompT μ α = StateT Word16 HostName μ α
 
-compress ∷ Monad μ ⇒ Word16 → CompT μ α → μ α
-compress i m = do
-  (_, _, x) ← runStateT m Map.empty $ Just i
-  return x
+compress ∷ Serializer s ⇒ Word16 → CompT s () → s
+compress i m = append mempty
+  where (append, _) = runWriter (runStateT m Map.empty $ Just i) id
 {-# INLINE compress #-}
 
 decompress ∷ Monad μ ⇒ Word16 → DecompT μ α → μ α
@@ -221,16 +239,22 @@ lift m = StateT $ \ptrs offset → do
            return (ptrs, offset, x)
 {-# INLINE lift #-}
 
+write ∷ Serializer s ⇒ s → CompT s ()
+write s = lift $ Writer $ \append → ((append s <>), ())
+{-# INLINE write #-}
+
 getOffset ∷ Monad μ ⇒ StateT k v μ (Maybe Word16)
 getOffset = StateT $ \ptrs offset → return (ptrs, offset, offset)
 {-# INLINE getOffset #-}
 
+addToOffset ∷ Word16 → Maybe Word16 → Maybe Word16
+addToOffset n (Just i) | i' ← i + n, i' >= i && i' <= 0x3FFF = Just i'
+addToOffset _ _ = Nothing
+{-# INLINE addToOffset #-}
+
 incOffset ∷ Monad μ ⇒ Word16 → StateT k v μ ()
-incOffset n = StateT $ \ptrs offset → do
-  let offset' = case offset of
-        Just i | i' ← i + n, i' >= i && i' <= 0x3FFF → Just i'
-        _ → Nothing
-  return (ptrs, offset', ())
+incOffset n = StateT $ \ptrs offset →
+  return (ptrs, addToOffset n offset, ())
 {-# INLINE incOffset #-}
 
 getEntries ∷ Monad μ ⇒ StateT k v μ (Map k v)
@@ -247,88 +271,28 @@ putEntry key value = StateT $ \ptrs offset → do
   return (Map.insert key value ptrs, offset, ())
 {-# INLINE putEntry #-}
 
-evalComp ∷ Monad μ
-         ⇒ (∀ α . μ α → (α, ByteString)) → CompT μ ()
-         → CompT μ ByteString
-evalComp run m = StateT $ \ptrs offset → do
-  let ((ptrs', offset', _), bs) = run $ runStateT m ptrs offset
-  return (ptrs', offset', bs)
+evalComp ∷ Serializer s ⇒ CompT BB.Builder () → CompT s BSL.ByteString
+evalComp m = StateT $ \ptrs offset → do
+  let (append, (ptrs', offset', _)) = runWriter (runStateT m ptrs offset) id
+  return (ptrs', offset', BB.toLazyByteString (append mempty))
 {-# INLINE evalComp #-}
 
-threadDecomp ∷ (∀ β . μ β → μ β) → DecompT μ α → DecompT μ α 
-threadDecomp f m = StateT $ \ptrs offset →
-  f $ runStateT m ptrs offset
-{-# INLINE threadDecomp #-}
+evalDecomp ∷ Deserializer μ
+           ⇒ Word16
+           → DecompT D.BinaryDeserializer α
+           → DecompT μ α
+evalDecomp len m = StateT $ \ptrs offset → do
+  buf ← BSL.fromStrict <$> D.take (fromIntegral len)
+  let getM = D.binaryDeserializer $ runStateT m ptrs offset
+  case B.runGetOrFail getM buf of
+    Left (_, _, e) → unexpected e
+    Right (_, _, (ptrs', _, x)) → return (ptrs', addToOffset len offset, x)
 
-class (Functor (GetM s), Monad (GetM s), Functor (PutM s), Monad (PutM s))
-      ⇒ Serializer s where
-  type GetM s ∷ ★ → ★
-  type PutM s ∷ ★ → ★
-  putWord8 ∷ s → Word8 → PutM s ()
-  putWord16be ∷ s → Word16 → PutM s ()
-  putWord32be ∷ s → Word32 → PutM s ()
-  putIP4 ∷ s → IP4 → PutM s ()
-  putIP6 ∷ s → IP6 → PutM s ()
-  putByteString ∷ s → ByteString → PutM s ()
-  runPutM ∷ s → PutM s α → (α, ByteString)
-  getWord8 ∷ s → GetM s Word8
-  getWord16be ∷ s → GetM s Word16
-  getWord32be ∷ s → GetM s Word32
-  getIP4 ∷ s → GetM s IP4
-  getIP6 ∷ s → GetM s IP6
-  getByteString ∷ s → Int → GetM s ByteString
-  isolate ∷ s → Int → GetM s α → GetM s α
-
-data BinarySerializer = BinarySerializer
-
-instance Serializer BinarySerializer where
-  type GetM BinarySerializer = B.Get
-  type PutM BinarySerializer = B.PutM
-  putWord8 _ = B.putWord8
-  putWord16be _ = B.putWord16be
-  putWord32be _ = B.putWord32be
-  putIP4 _ = B.put
-  putIP6 _ = B.put
-  putByteString _ = B.putByteString
-  runPutM _ p = (r, BSL.toStrict bs) where (r, bs) = B.runPutM p
-  getWord8 _ = B.getWord8
-  getWord16be _ = B.getWord16be
-  getWord32be _ = B.getWord32be
-  getIP4 _ = B.get
-  getIP6 _ = B.get
-  getByteString _ =
-#if MIN_VERSION_binary(0,6,0)
-    B.getByteString
-#else
-    B.getBytes
-#endif
-  isolate _ = undefined
-
-data CerealSerializer = CerealSerializer
-
-instance Serializer CerealSerializer where
-  type GetM CerealSerializer = S.Get
-  type PutM CerealSerializer = S.PutM
-  putWord8 _ = S.putWord8
-  putWord16be _ = S.putWord16be
-  putWord32be _ = S.putWord32be
-  putIP4 _ = S.put
-  putIP6 _ = S.put
-  putByteString _ = S.putByteString
-  runPutM _ = S.runPutM
-  getWord8 _ = S.getWord8
-  getWord16be _ = S.getWord16be
-  getWord32be _ = S.getWord32be
-  getIP4 _ = S.get
-  getIP6 _ = S.get
-  getByteString _ = S.getBytes
-  isolate _ = S.isolate
-
-serializeHostName ∷ Serializer s ⇒ s → HostName → CompT (PutM s) ()
-serializeHostName s = go . hostNameLabels
+serializeHostName ∷ Serializer s ⇒ HostName → CompT s ()
+serializeHostName = go . hostNameLabels
   where
     go [] = do
-      lift $ putWord8 s 0
+      write $ S.word8 0
       incOffset 1
     go labels@(label : labels') = do
       entry ← getEntry labels
@@ -336,21 +300,21 @@ serializeHostName s = go . hostNameLabels
         Nothing → do
           let ll = BS.length label
           offset ← getOffset
-          lift $ putWord8 s $ fromIntegral ll
-          lift $ putByteString s label
+          write $  S.word8 (fromIntegral ll)
+                <> S.byteString label
           incOffset $ 1 + fromIntegral ll
           forM_ offset $ putEntry labels
           go labels'
         Just ptr → do
-          lift $ putWord16be s $ 0xC000 .|. ptr
+          write $ S.word16B $ 0xC000 .|. ptr
           incOffset 2
 
-guard' ∷ Monad μ ⇒ String → Bool → μ ()
-guard' msg test = unless test $ fail msg
-{-# INLINE guard' #-}
+guard ∷ Deserializer μ ⇒ String → Bool → μ ()
+guard msg test = unless test $ unexpected msg
+{-# INLINE guard #-}
 
-deserializeHostName ∷ Serializer s ⇒ s → DecompT (GetM s) HostName
-deserializeHostName s = go []
+deserializeHostName ∷ Deserializer μ ⇒ DecompT μ HostName
+deserializeHostName = go []
   where
     folder suffix (label, offset) = do
         forM_ offset $ \i → putEntry i (HN suffix')
@@ -358,30 +322,31 @@ deserializeHostName s = go []
       where suffix' = BS.append label $ BS.cons (A.ascii '.') suffix
     go labels = do
       offset ← getOffset
-      w ← lift $ getWord8 s
+      w ← lift D.word8
       incOffset 1
       if w .&. 0xC0 == 0xC0
       then do
-        w' ← lift $ getWord8 s
+        w' ← lift D.word8
         incOffset 1
         let ptr = fromIntegral (w .&. 0x3F) `shiftL` 8 .|. fromIntegral w'
         entry ← getEntry ptr
         case entry of
           Nothing → do
             entries ← getEntries
-            fail $ "Invalid pointer " ++ show ptr ++ ": pointer map is " ++
-                   show (Map.elems entries)
+            lift $ unexpected $  "Invalid pointer " ++ show ptr
+                              ++ ": pointer map is "
+                              ++ show (Map.elems entries)
           Just (HN suffix1) → HN <$> foldM folder suffix1 labels
       else
         if w == 0
         then do
-          guard' "Hostname with zero labels" $ not $ null labels
+          lift $ guard "Hostname with zero labels" $ not $ null labels
           let (lastLabel, lastOffset) : labels' = labels
           forM_ lastOffset $ \i → putEntry i (HN lastLabel)
           HN <$> foldM folder lastLabel labels'
         else do
-          guard' "Label is too long" $ w <= 63
-          label ← lift $ getByteString s $ fromIntegral w
+          lift $ guard "Label is too long" $ w <= 63
+          label ← lift $ D.take $ fromIntegral w
           incOffset $ fromIntegral w
           go ((BS.map A.toLower8 label, offset) : labels)
 
@@ -436,7 +401,7 @@ type DnsId = Word16
 -- | Resource Record type.
 data DnsType α where
   -- IPv4 address record (/A/)
-  AddrDnsType  ∷ DnsType IP4 
+  AddrDnsType  ∷ DnsType IP4
   -- IPv6 address record (/AAAA/)
   Addr6DnsType ∷ DnsType IP6
   -- Name server record (/NS/)
@@ -503,41 +468,42 @@ data DnsRecord = DnsRecord { -- | Record owner
                            }
                  deriving (Typeable, Show)
 
-serializeDnsRecord ∷ Serializer s ⇒ s → DnsRecord → CompT (PutM s) ()
-serializeDnsRecord s (DnsRecord {..}) | DnsData tp dt ← dnsRecData = do
-  serializeHostName s dnsRecOwner
-  lift $ putWord16be s $ dnsTypeCode tp
-  lift $ putWord16be s 1
-  lift $ putWord32be s dnsRecTtl
+serializeDnsRecord ∷ Serializer s ⇒ DnsRecord → CompT s ()
+serializeDnsRecord (DnsRecord {..}) | DnsData tp dt ← dnsRecData = do
+  serializeHostName dnsRecOwner
+  write $  S.word16B (dnsTypeCode tp)
+        <> S.word16B 1
+        <> S.word32B dnsRecTtl
   incOffset 10
-  d ← evalComp (runPutM s) $ case tp of
-    AddrDnsType  → lift (putIP4 s dt) >> incOffset 4
-    Addr6DnsType → lift (putIP6 s dt) >> incOffset 16
-    NsDnsType    → serializeHostName s dt
-    CNameDnsType → serializeHostName s dt
-    PtrDnsType   → serializeHostName s dt
+  d ← evalComp $ case tp of
+    AddrDnsType  → write (S.put dt) >> incOffset 4
+    Addr6DnsType → write (S.put dt) >> incOffset 16
+    NsDnsType    → serializeHostName dt
+    CNameDnsType → serializeHostName dt
+    PtrDnsType   → serializeHostName dt
     MxDnsType    → do
-      lift $ putWord16be s $ fst dt
+      write $ S.word16B $ fst dt
       incOffset 2
-      serializeHostName s $ snd dt
-  lift $ putWord16be s $ fromIntegral $ BS.length d
-  lift $ putByteString s d
+      serializeHostName $ snd dt
+  let len = fromIntegral (BSL.length d)
+  write $  S.word16B len
+        <> S.lazyByteString (BSL.take (fromIntegral len) d)
 
-deserializeDnsRecord ∷ Serializer s ⇒ s → DecompT (GetM s) DnsRecord
-deserializeDnsRecord s = do
-  owner ← deserializeHostName s
-  code  ← lift $ getWord16be s
-  void $ lift $ getWord16be s
-  ttl   ← lift $ getWord32be s
-  len   ← lift $ fromIntegral <$> getWord16be s
+deserializeDnsRecord ∷ Deserializer μ ⇒ DecompT μ DnsRecord
+deserializeDnsRecord = do
+  owner ← deserializeHostName
+  code  ← lift D.word16B
+  void $ lift D.word16B
+  ttl   ← lift D.word32B
+  len   ← lift D.word16B
   incOffset 10
-  dd    ← threadDecomp (isolate s len) $ case code of
-    1  → fmap (DnsData AddrDnsType) $ incOffset 4 >> lift (getIP4 s)
-    2  → DnsData NsDnsType    <$> deserializeHostName s
-    5  → DnsData CNameDnsType <$> deserializeHostName s
-    12 → DnsData PtrDnsType   <$> deserializeHostName s
-    28 → fmap (DnsData Addr6DnsType) $ incOffset 16 >> lift (getIP6 s)
-    _  → fail "Unsupported type"
+  dd ← evalDecomp len $ case code of
+    1  → DnsData AddrDnsType  <$> (incOffset 4 >> lift D.get)
+    2  → DnsData NsDnsType    <$> deserializeHostName
+    5  → DnsData CNameDnsType <$> deserializeHostName
+    12 → DnsData PtrDnsType   <$> deserializeHostName
+    28 → DnsData Addr6DnsType <$> (incOffset 16 >> lift D.get)
+    _  → lift $ unexpected $ "Unsupported type " ++ show code
   return $ DnsRecord owner ttl dd
 
 -- | DNS query type.
@@ -562,26 +528,23 @@ instance Eq DnsQType where
 instance Ord DnsQType where
   t1 `compare` t2 = dnsQTypeCode t1 `compare` dnsQTypeCode t2
 
-putDnsQType ∷ Serializer s ⇒ s → DnsQType → PutM s ()
-putDnsQType s = putWord16be s . dnsQTypeCode
+instance Serializable DnsQType where
+  put = S.word16B . dnsQTypeCode
+  {-# INLINE put #-}
 
-getDnsQType ∷ Serializer s ⇒ s → GetM s DnsQType
-getDnsQType s = getWord16be s >>= \case
-  1   → return $ StdDnsType AddrDnsType
-  2   → return $ StdDnsType NsDnsType
-  5   → return $ StdDnsType CNameDnsType
-  12  → return $ StdDnsType PtrDnsType
-  28  → return $ StdDnsType Addr6DnsType
-  255 → return AllDnsType
-  _   → fail "Unsupported query type"
+instance SizedSerializable DnsQType where
+  size _ = 2
+  {-# INLINE size #-}
 
-instance Binary DnsQType where
-  put = putDnsQType BinarySerializer
-  get = getDnsQType BinarySerializer
-
-instance Serialize DnsQType where
-  put = putDnsQType CerealSerializer
-  get = getDnsQType CerealSerializer
+instance Deserializable DnsQType where
+  get = D.word16B >>= \case
+    1   → return $ StdDnsType AddrDnsType
+    2   → return $ StdDnsType NsDnsType
+    5   → return $ StdDnsType CNameDnsType
+    12  → return $ StdDnsType PtrDnsType
+    28  → return $ StdDnsType Addr6DnsType
+    255 → return AllDnsType
+    t   → unexpected $ "Unsupported query type" ++ show t
 
 -- | DNS question.
 data DnsQuestion = DnsQuestion { -- | Ask about the specified host name
@@ -591,19 +554,17 @@ data DnsQuestion = DnsQuestion { -- | Ask about the specified host name
                                }
                    deriving (Typeable, Show, Eq, Ord)
 
-serializeDnsQuestion ∷ Serializer s ⇒ s → DnsQuestion → CompT (PutM s) ()
-serializeDnsQuestion s (DnsQuestion {..}) = do
-  serializeHostName s dnsQName
-  lift $ do
-    putDnsQType s dnsQType
-    putWord16be s 1
+serializeDnsQuestion ∷ Serializer s ⇒ DnsQuestion → CompT s ()
+serializeDnsQuestion (DnsQuestion {..}) = do
+  serializeHostName dnsQName
+  write $  S.put dnsQType
+        <> S.word16B 1
   incOffset 4
 
-deserializeDnsQuestion ∷ Serializer s ⇒ s → DecompT (GetM s) DnsQuestion
-deserializeDnsQuestion s = do
-  q ← DnsQuestion <$> deserializeHostName s <*> lift (getDnsQType s)
-  c ← lift $ getWord16be s
-  guard' "Unsupported class in a question" $ c == 1
+deserializeDnsQuestion ∷ Deserializer μ ⇒ DecompT μ DnsQuestion
+deserializeDnsQuestion = do
+  q ← DnsQuestion <$> deserializeHostName <*> lift D.get
+  lift $ D.word16B >>= guard "Unsupported class in a question" . (== 1)
   incOffset 4
   return q
 
@@ -628,74 +589,67 @@ data DnsReq -- | Standard query
 anyHostName ∷ HostName
 anyHostName = HN "any"
 
-putDnsReq ∷ Serializer s ⇒ s → DnsReq → PutM s ()
-putDnsReq s (DnsReq {..}) = do
-  putWord16be s dnsReqId
-  putWord8 s  $  if dnsReqRec then 1 else 0
-             .|. if dnsReqTruncd then 2 else 0
-  putWord8 s 0
-  putWord16be s 1
-  putWord16be s 0
-  putWord16be s 0
-  putWord16be s 0
-  compress 12 $ serializeDnsQuestion s dnsReqQuestion
-putDnsReq s (DnsInvReq {..}) = do
-  putWord16be s dnsReqId
-  putWord8 s 8
-  putWord8 s 0
-  putWord16be s 0
-  putWord16be s 1
-  putWord16be s 0
-  putWord16be s 0
-  compress 12 $ serializeDnsRecord s $
-    DnsRecord { dnsRecOwner = anyHostName
-              , dnsRecTtl   = 0
-              , dnsRecData  = case dnsReqInv of
-                  IPv4 a → DnsData AddrDnsType a
-                  IPv6 a → DnsData Addr6DnsType a }
+instance Serializable DnsReq where
+  put (DnsReq {..})
+    =  S.word16B dnsReqId
+    <> S.word8 (if dnsReqRec then 1 else 0
+                .|. if dnsReqTruncd then 2 else 0)
+    <> S.word8 0
+    <> S.word16B 1
+    <> S.word16B 0
+    <> S.word16B 0
+    <> S.word16B 0
+    <> compress 12 (serializeDnsQuestion dnsReqQuestion)
+  put (DnsInvReq {..})
+      =  S.word16B dnsReqId
+      <> S.word8 8
+      <> S.word8 0
+      <> S.word16B 0
+      <> S.word16B 1
+      <> S.word16B 0
+      <> S.word16B 0
+      <> compress 12 (serializeDnsRecord record)
+    where
+      record = DnsRecord { dnsRecOwner = anyHostName
+                         , dnsRecTtl   = 0
+                         , dnsRecData  = case dnsReqInv of
+                             IPv4 a → DnsData AddrDnsType a
+                             IPv6 a → DnsData Addr6DnsType a }
 
-getDnsReq ∷ Serializer s ⇒ s → GetM s DnsReq
-getDnsReq s = do
-  i ← getWord16be s
-  w ← getWord8 s
-  void $ getWord8 s
-  guard' "Not a request" $ w .&. 128 == 0
-  let rec    = w .&. 1 /= 0
-      truncd = w .&. 2 /= 0
-      opcode = w `shiftR` 3 .&. 0xF
-  case opcode of
-    0 → do
-      getWord16be s >>= guard' "No questions in query" . (== 1)
-      getWord16be s >>= guard' "Answers in query" . (== 0)
-      getWord16be s >>= guard' "Authorities in query" . (== 0)
-      getWord16be s >>= guard' "Extras in query" . (== 0)
-      decompress 12 $ do
-        q ← deserializeDnsQuestion s
-        return $ DnsReq { dnsReqId       = i
-                        , dnsReqTruncd   = truncd
-                        , dnsReqRec      = rec
-                        , dnsReqQuestion = q }
-    1 → do
-      getWord16be s >>= guard' "Questions in inverse query" . (== 0)
-      getWord16be s >>= guard' "No answers in inverse query" . (== 1)
-      getWord16be s >>= guard' "Authorities in inverse query" . (== 0)
-      getWord16be s >>= guard' "Extras in inverse query" . (== 0)
-      DnsRecord {dnsRecData} ← decompress 12 $ deserializeDnsRecord s
-      case dnsRecData of
-        DnsData AddrDnsType a →
-          return $ DnsInvReq { dnsReqId  = i, dnsReqInv = IPv4 a }
-        DnsData Addr6DnsType a →
-          return $ DnsInvReq { dnsReqId  = i, dnsReqInv = IPv6 a }
-        _ → fail "Invalid answer RR in inverse query"
-    _ → fail "Invalid opcode in request"
-
-instance Binary DnsReq where
-  put = putDnsReq BinarySerializer
-  get = getDnsReq BinarySerializer
-
-instance Serialize DnsReq where
-  put = putDnsReq CerealSerializer
-  get = getDnsReq CerealSerializer
+instance Deserializable DnsReq where
+  get = do
+    i ← D.word16B
+    w ← D.word8
+    void D.word8
+    guard "Not a request" $ w .&. 128 == 0
+    let rec    = w .&. 1 /= 0
+        truncd = w .&. 2 /= 0
+        opcode = w `shiftR` 3 .&. 0xF
+    case opcode of
+      0 → do
+        D.word16B >>= guard "No questions in query" . (== 1)
+        D.word16B >>= guard "Answers in query" . (== 0)
+        D.word16B >>= guard "Authorities in query" . (== 0)
+        D.word16B >>= guard "Extras in query" . (== 0)
+        decompress 12 $ do
+          q ← deserializeDnsQuestion
+          return $ DnsReq { dnsReqId       = i
+                          , dnsReqTruncd   = truncd
+                          , dnsReqRec      = rec
+                          , dnsReqQuestion = q }
+      1 → do
+        D.word16B >>= guard "Questions in inverse query" . (== 0)
+        D.word16B >>= guard "No answers in inverse query" . (== 1)
+        D.word16B >>= guard "Authorities in inverse query" . (== 0)
+        D.word16B >>= guard "Extras in inverse query" . (== 0)
+        DnsRecord {dnsRecData} ← decompress 12 deserializeDnsRecord
+        case dnsRecData of
+          DnsData AddrDnsType a →
+            return $ DnsInvReq { dnsReqId  = i, dnsReqInv = IPv4 a }
+          DnsData Addr6DnsType a →
+            return $ DnsInvReq { dnsReqId  = i, dnsReqInv = IPv6 a }
+          _ → unexpected "Invalid answer RR in inverse query"
+      _ → unexpected $ "Invalid opcode " ++ show opcode ++ " in request"
 
 -- | Errors returned in responses.
 data DnsError = FormatDnsError
@@ -710,7 +664,7 @@ data DnsError = FormatDnsError
               | NotInZoneDnsError
               deriving (Typeable, Show, Read, Eq, Ord, Enum)
 
--- | Numerical representation of an error.
+-- | Numerical representation of the error.
 dnsErrorCode ∷ DnsError → Word8
 dnsErrorCode FormatDnsError     = 1
 dnsErrorCode FailureDnsError    = 2
@@ -749,83 +703,76 @@ data DnsResp -- | Normal response.
                           }
              deriving (Typeable, Show)
 
-putDnsResp ∷ Serializer s ⇒ s → DnsResp → PutM s ()
-putDnsResp s (DnsResp {..}) = do
-  putWord16be s dnsRespId
-  putWord8 s  $  128
-             .|. if dnsRespTruncd then 2 else 0
-             .|. if dnsRespAuthd then 4 else 0
-  putWord8 s $ if dnsRespRec then 128 else 0
-  putWord16be s 1
-  putWord16be s $ fromIntegral $ length dnsRespAnswers
-  putWord16be s $ fromIntegral $ length dnsRespAuths
-  putWord16be s $ fromIntegral $ length dnsRespExtras
-  compress 12 $ do
-    serializeDnsQuestion s dnsRespQuestion
-    forM_ dnsRespAnswers (serializeDnsRecord s)
-    forM_ dnsRespAuths   (serializeDnsRecord s)
-    forM_ dnsRespExtras  (serializeDnsRecord s)
-putDnsResp s (DnsErrResp {..}) = do
-  putWord16be s dnsRespId
-  putWord8 s 8
-  putWord8 s $ dnsErrorCode dnsRespError
-  putWord16be s 0
-  putWord16be s 0
-  putWord16be s 0
-  putWord16be s 0
+instance Serializable DnsResp where
+  put (DnsResp {..})
+      =  S.word16B dnsRespId
+      <> S.word8 (128
+                  .|. if dnsRespTruncd then 2 else 0
+                  .|. if dnsRespAuthd then 4 else 0)
+      <> S.word8 (if dnsRespRec then 128 else 0)
+      <> S.word16B 1
+      <> S.word16B (fromIntegral $ length dnsRespAnswers)
+      <> S.word16B (fromIntegral $ length dnsRespAuths)
+      <> S.word16B (fromIntegral $ length dnsRespExtras)
+      <> compress 12 records
+    where records = do
+            serializeDnsQuestion dnsRespQuestion
+            forM_ dnsRespAnswers serializeDnsRecord
+            forM_ dnsRespAuths   serializeDnsRecord
+            forM_ dnsRespExtras  serializeDnsRecord
+  put (DnsErrResp {..})
+    =  S.word16B dnsRespId
+    <> S.word8 8
+    <> S.word8 (fromIntegral $ dnsErrorCode dnsRespError)
+    <> S.word16B 0
+    <> S.word16B 0
+    <> S.word16B 0
+    <> S.word16B 0
 
-getDnsResp ∷ Serializer s ⇒ s → GetM s DnsResp
-getDnsResp s = do
-  i ← getWord16be s
-  w ← getWord8 s
-  guard' "Not a response" $ w .&. 128 /= 0
-  w' ← getWord8 s
-  let truncd = w .&. 2 /= 0
-      authd  = w .&. 4 /= 0
-      rec    = w' .&. 128 /= 0
-      ec     = w' .&. 0xF
-  case ec of
-    0 → do
-      getWord16be s >>= guard' "No question in a response" . (== 1)
-      anc ← getWord16be s
-      nsc ← getWord16be s
-      arc ← getWord16be s
-      decompress 12 $ do
-        q   ← deserializeDnsQuestion s
-        ans ← mapM (const $ deserializeDnsRecord s) [1 .. anc] 
-        nss ← mapM (const $ deserializeDnsRecord s) [1 .. nsc] 
-        ars ← mapM (const $ deserializeDnsRecord s) [1 .. arc] 
-        return $ DnsResp { dnsRespId       = i
-                         , dnsRespTruncd   = truncd
-                         , dnsRespAuthd    = authd
-                         , dnsRespRec      = rec
-                         , dnsRespQuestion = q
-                         , dnsRespAnswers  = ans
-                         , dnsRespAuths    = nss
-                         , dnsRespExtras   = ars }
-    _ → do
-      void $ getWord16be s
-      void $ getWord16be s
-      void $ getWord16be s
-      void $ getWord16be s
-      DnsErrResp i <$> case ec of
-        1  → return FormatDnsError
-        2  → return FailureDnsError
-        3  → return NoNameDnsError
-        4  → return NotImplDnsError
-        5  → return RefusedDnsError
-        6  → return NameExistsDnsError
-        7  → return RsExistsDnsError
-        8  → return NoRsDnsError
-        9  → return NotAuthDnsError
-        10 → return NotInZoneDnsError
-        _  → fail "Unknown error code in a response"
-
-instance Binary DnsResp where
-  put = putDnsResp BinarySerializer
-  get = getDnsResp BinarySerializer
-
-instance Serialize DnsResp where
-  put = putDnsResp CerealSerializer
-  get = getDnsResp CerealSerializer
+instance Deserializable DnsResp where
+  get = do
+    i ← D.word16B
+    w ← D.word8
+    guard "Not a response" $ w .&. 128 /= 0
+    w' ← D.word8
+    let truncd = w .&. 2 /= 0
+        authd  = w .&. 4 /= 0
+        rec    = w' .&. 128 /= 0
+        ec     = w' .&. 0xF
+    case ec of
+      0 → do
+        D.word16B >>= guard "No question in a response" . (== 1)
+        anc ← D.word16B
+        nsc ← D.word16B
+        arc ← D.word16B
+        decompress 12 $ do
+          q   ← deserializeDnsQuestion
+          ans ← mapM (const deserializeDnsRecord) [1 .. anc]
+          nss ← mapM (const deserializeDnsRecord) [1 .. nsc]
+          ars ← mapM (const deserializeDnsRecord) [1 .. arc]
+          return $ DnsResp { dnsRespId       = i
+                           , dnsRespTruncd   = truncd
+                           , dnsRespAuthd    = authd
+                           , dnsRespRec      = rec
+                           , dnsRespQuestion = q
+                           , dnsRespAnswers  = ans
+                           , dnsRespAuths    = nss
+                           , dnsRespExtras   = ars }
+      _ → do
+        void D.word16B
+        void D.word16B
+        void D.word16B
+        void D.word16B
+        DnsErrResp i <$> case ec of
+          1  → return FormatDnsError
+          2  → return FailureDnsError
+          3  → return NoNameDnsError
+          4  → return NotImplDnsError
+          5  → return RefusedDnsError
+          6  → return NameExistsDnsError
+          7  → return RsExistsDnsError
+          8  → return NoRsDnsError
+          9  → return NotAuthDnsError
+          10 → return NotInZoneDnsError
+          _  → unexpected $ "Unknown error code " ++ show ec
 

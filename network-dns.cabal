@@ -12,11 +12,13 @@ Bug-Reports: https://github.com/mvv/network-dns/issues
 
 Author: Mikhail Vorozhtsov <mikhail.vorozhtsov@gmail.com>
 Maintainer: Mikhail Vorozhtsov <mikhail.vorozhtsov@gmail.com>
-Copyright: 2013 Mikhail Vorozhtsov <mikhail.vorozhtsov@gmail.com>
+Copyright: 2013, 2017 Mikhail Vorozhtsov <mikhail.vorozhtsov@gmail.com>
 License: BSD3
 License-File: LICENSE
 
 Extra-Source-Files: examples/Resolver.hs
+
+Tested-With: GHC==7.10.3, GHC==8.0.2, GHC==8.2.1
 
 Cabal-Version: >= 1.10.0
 Build-Type: Simple
@@ -27,19 +29,18 @@ Source-Repository head
 
 Library
   Default-Language: Haskell2010
-  Build-Depends:
-    base         >= 4.3 && < 5,
-    tagged       >= 0.2,
-    hashable     >= 1.1,
-    containers   >= 0.4,
-    binary       >= 0.5,
-    cereal       >= 0.3,
-    bytestring   >= 0.10,
-    text-latin1  >= 0.2,
-    text-printer >= 0.3,
-    data-textual >= 0.1,
-    parsers      >= 0.5,
-    network-ip   >= 0.2
+  Build-Depends: base            >= 4.3 && < 5
+               , type-hint       >= 0.1
+               , hashable        >= 1.1
+               , containers      >= 0.4
+               , data-serializer >= 0.3
+               , binary          >= 0.6.4
+               , bytestring      >= 0.10
+               , text-latin1     >= 0.2
+               , text-printer    >= 0.5
+               , data-textual    >= 0.3
+               , parsers         >= 0.5
+               , network-ip      >= 0.3
   Hs-Source-Dirs: src
   GHC-Options: -Wall
   Exposed-Modules:
