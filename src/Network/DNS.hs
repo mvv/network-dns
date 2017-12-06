@@ -64,7 +64,6 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.ByteString.Builder as BB
-import qualified Data.Binary.Get as B
 import Data.Serializer (Serializer, Serializable, SizedSerializable)
 import qualified Data.Serializer as S
 import Data.Deserializer (Deserializer, Deserializable)
@@ -279,14 +278,13 @@ evalComp m = StateT $ \ptrs offset → do
 
 evalDecomp ∷ Deserializer μ
            ⇒ Word16
-           → DecompT D.BinaryDeserializer α
+           → DecompT μ α
            → DecompT μ α
 evalDecomp len m = StateT $ \ptrs offset → do
-  buf ← BSL.fromStrict <$> D.take (fromIntegral len)
-  let getM = D.binaryDeserializer $ runStateT m ptrs offset
-  case B.runGetOrFail getM buf of
-    Left (_, _, e) → unexpected e
-    Right (_, _, (ptrs', _, x)) → return (ptrs', addToOffset len offset, x)
+    D.isolate (fromIntegral len) $ runStateT (m >>= drain) ptrs offset
+  where drain r = lift D.chunk >>= \case
+          bs | BS.null bs → return r
+          bs → incOffset (fromIntegral $ BS.length bs) >> drain r
 
 serializeHostName ∷ Serializer s ⇒ HostName → CompT s ()
 serializeHostName = go . hostNameLabels

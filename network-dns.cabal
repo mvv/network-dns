@@ -34,7 +34,6 @@ Library
                , hashable        >= 1.1
                , containers      >= 0.4
                , data-serializer >= 0.3.2
-               , binary          >= 0.6.4
                , bytestring      >= 0.10
                , text-latin1     >= 0.2
                , text-printer    >= 0.5
