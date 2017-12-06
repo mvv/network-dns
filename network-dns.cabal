@@ -33,7 +33,7 @@ Library
                , type-hint       >= 0.1
                , hashable        >= 1.1
                , containers      >= 0.4
-               , data-serializer >= 0.3
+               , data-serializer >= 0.3.2
                , binary          >= 0.6.4
                , bytestring      >= 0.10
                , text-latin1     >= 0.2
@@ -45,3 +45,17 @@ Library
   GHC-Options: -Wall
   Exposed-Modules:
     Network.DNS
+
+Executable hs-network-dns-examples-resolver
+  Scope: private
+  Default-Language: Haskell2010
+  Build-Depends: base
+               , data-textual
+               , data-serializer
+               , network-ip
+               , network-dns
+  if !os(windows)
+    Build-Depends: posix-socket >= 0.2
+  Hs-Source-Dirs: examples
+  Main-Is: Resolver.hs
+  GHC-Options: -Wall
