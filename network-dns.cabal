@@ -22,7 +22,7 @@ Extra-Source-Files:
 
 Tested-With: GHC==7.10.3, GHC==8.0.2, GHC==8.2.2, GHC==8.4.1
 
-Cabal-Version: >= 2.0
+Cabal-Version: 2.0
 Build-Type: Simple
 
 Source-Repository head
