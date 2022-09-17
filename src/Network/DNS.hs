@@ -229,8 +229,10 @@ instance Monad μ ⇒ Monad (StateT k v μ) where
               (ptrs', offset', x) ← runStateT m ptrs offset
               runStateT (f x) ptrs' offset'
   {-# INLINE (>>=) #-}
+#if !MIN_VERSION_base(4,13,0)
   fail msg = lift $ fail msg
   {-# INLINE fail #-}
+#endif
 
 lift ∷ Monad μ ⇒ μ α → StateT k v μ α
 lift m = StateT $ \ptrs offset → do

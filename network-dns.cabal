@@ -1,5 +1,5 @@
 Name: network-dns
-Version: 1.1.0.1
+Version: 1.1.0.2
 Category: Network
 Stability: experimental
 Synopsis: Domain Name System data structures
@@ -20,9 +20,10 @@ Extra-Source-Files:
   examples/Resolver.hs
   README.md
 
-Tested-With: GHC==7.10.3, GHC==8.0.2, GHC==8.2.2, GHC==8.4.1, GHC==8.6.1
+Tested-With: GHC==7.10.3, GHC==8.0.2, GHC==8.2.2, GHC==8.4.4, GHC==8.6.5,
+             GHC==8.8.4, GHC==8.10.7, GHC==9.0.2, GHC==9.2.4, GHC==9.4.2
 
-Cabal-Version: 2.0
+Cabal-Version: >= 1.10.0
 Build-Type: Simple
 
 Source-Repository head
